@@ -5,3 +5,7 @@ __pycache__/
 downloads/
 state.json
 *.tmp
+state.db
+state.db-journal
+.pytest_cache/
+uv.lock

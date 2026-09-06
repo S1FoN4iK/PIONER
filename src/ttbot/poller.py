@@ -5,13 +5,13 @@ import logging
 
 from .bot import VideoSender
 from .config import Settings
+from .media import Downloader, Watch, parse_watch
 from .state import State
-from .media import Downloader, normalize_username
 
 logger = logging.getLogger(__name__)
 
-_FEED_WINDOW = 15 
-_BETWEEN_SENDS = 2  
+_FEED_WINDOW = 15
+_BETWEEN_SENDS = 2
 
 
 class Poller:
@@ -26,11 +26,12 @@ class Poller:
         self._state = state
         self._downloader = downloader
         self._sender = sender
+        self._watches = _parse_all(settings.watches)
 
     async def run(self) -> None:
         logger.info(
-            "poller started: %d profile(s), every %ds -> chat %s",
-            len(self._settings.profiles),
+            "poller started: %d source(s), every %ds -> chat %s",
+            len(self._watches),
             self._settings.poll_interval_seconds,
             self._settings.target_chat_id,
         )
@@ -39,7 +40,7 @@ class Poller:
                 await self._tick()
             except asyncio.CancelledError:
                 raise
-            except Exception: 
+            except Exception:
                 logger.exception("poll tick failed")
             await asyncio.sleep(self._settings.poll_interval_seconds)
 
@@ -47,28 +48,37 @@ class Poller:
         target = self._settings.target_chat_id
         if target is None:
             return
-        for profile in self._settings.profiles:
-            username = normalize_username(profile)
-            videos = await self._downloader.list_user(username, _FEED_WINDOW)
+        for watch in self._watches:
+            videos = await self._downloader.list_feed(watch, _FEED_WINDOW)
             if not videos:
                 continue
             ids = [v.video_id for v in videos]
 
-            if not await self._state.is_bootstrapped(username):
-                await self._state.seed(username, ids)
-                logger.info("bootstrapped @%s with %d existing posts", username, len(ids))
+            if not await self._state.is_bootstrapped(watch.key):
+                await self._state.seed(watch.key, ids)
+                logger.info("bootstrapped %s with %d existing posts", watch.key, len(ids))
                 continue
 
             fresh = [
-                v for v in videos if not await self._state.is_seen(username, v.video_id)
+                v for v in videos if not await self._state.is_seen(watch.key, v.video_id)
             ]
             for video in reversed(fresh):
                 try:
                     await self._sender.send_from_url(target, video.page_url)
-                    await self._state.mark_seen(username, video.video_id)
-                    logger.info("posted new video %s from @%s", video.video_id, username)
+                    await self._state.mark_seen(watch.key, video.video_id)
+                    logger.info("posted new post %s from %s", video.video_id, watch.key)
                     await asyncio.sleep(_BETWEEN_SENDS)
                 except Exception:
                     logger.exception(
-                        "failed to post %s from @%s", video.video_id, username
+                        "failed to post %s from %s", video.video_id, watch.key
                     )
+
+
+def _parse_all(sources: list[str]) -> list[Watch]:
+    out: list[Watch] = []
+    for raw in sources:
+        try:
+            out.append(parse_watch(raw))
+        except ValueError as exc:
+            logger.warning("не разобрали источник %r: %s", raw, exc)
+    return out

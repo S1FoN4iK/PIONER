@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -46,6 +47,10 @@ _PLATFORM_RES: list[tuple[Platform, re.Pattern[str]]] = [
 _VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
 _IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
 _AUDIO_EXT = {".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav"}
+
+_TIKWM_RETRIES = 2 
+_FEED_ATTEMPTS = 2    
+_FEED_RETRY_PAUSE = 3.0  
 
 
 @dataclass
@@ -114,12 +119,52 @@ def looks_like_profile_url(url: str) -> bool:
     return bool(re.search(r"tiktok\.com/@[\w.\-]+/?$", url, re.IGNORECASE))
 
 
-def normalize_username(profile: str) -> str:
-    p = profile.strip()
-    if p.startswith("http"):
-        m = re.search(r"@([\w.\-]+)", p)
-        p = m.group(1) if m else p.rstrip("/").split("/")[-1]
-    return p.lstrip("@")
+@dataclass(frozen=True)
+class Watch:
+
+    key: str  
+    url: str 
+    platform: Platform | None
+
+
+_CHANNEL_RES: list[tuple[Platform, re.Pattern[str]]] = [
+    (
+        Platform.YOUTUBE,
+        re.compile(
+            r"https?://(?:www\.|m\.)?youtube\.com/(?:@[\w.\-]+|(?:c|user|channel)/[\w.\-]+)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        Platform.INSTAGRAM,
+        re.compile(r"https?://(?:www\.)?instagram\.com/([\w.\-]+)/?$", re.IGNORECASE),
+    ),
+    (
+        Platform.TIKTOK,
+        re.compile(r"https?://(?:www\.)?tiktok\.com/@([\w.\-]+)", re.IGNORECASE),
+    ),
+]
+
+
+def parse_watch(raw: str) -> Watch:
+    item = raw.strip().rstrip("/")
+    if not item:
+        raise ValueError("пустой источник")
+
+    if not item.startswith("http"):
+        username = item.lstrip("@")
+        return Watch(username, f"https://www.tiktok.com/@{username}", Platform.TIKTOK)
+
+    for platform, pattern in _CHANNEL_RES:
+        match = pattern.match(item)
+        if not match:
+            continue
+        if platform is Platform.YOUTUBE:
+            url = item if item.endswith("/videos") else f"{item}/videos"
+            return Watch(item, url, platform)
+        return Watch(match.group(1), item, platform)
+
+    return Watch(item, item, None)
 
 
 def page_url_for(username: str, video_id: str) -> str:
@@ -131,6 +176,26 @@ def _as_float(value) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _short(exc: Exception, limit: int = 160) -> str:
+    """yt-dlp вываливает в ошибку простыню про «report this issue» — режем."""
+    text = " ".join(str(exc).split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _flat_entries(info: dict | None) -> list[dict]:
+    """YouTube-каналы иногда отдают вкладки — записи лежат на уровень глубже."""
+    out: list[dict] = []
+    for entry in (info or {}).get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        nested = entry.get("entries")
+        if isinstance(nested, list):
+            out.extend(e for e in nested if isinstance(e, dict))
+        else:
+            out.append(entry)
+    return out
 
 
 def _classify(files: list[Path]) -> tuple[list[Path], list[Path], Path | None]:
@@ -146,24 +211,51 @@ class TikwmProvider:
     name = "tikwm"
     platforms = frozenset({Platform.TIKTOK})
 
-    def __init__(self, base: str, client: httpx.AsyncClient, timeout: int) -> None:
+    def __init__(
+        self,
+        base: str,
+        client: httpx.AsyncClient,
+        timeout: int,
+        min_interval: float = 1.1,
+    ) -> None:
         self._base = base.rstrip("/")
         self._client = client
         self._timeout = timeout
+        self._min_interval = max(0.0, min_interval)
+        self._gate = asyncio.Lock()
+        self._next_at = 0.0
 
     def _absolute(self, url: str) -> str:
         return f"{self._base}{url}" if url.startswith("/") else url
 
+    async def _api(self, path: str, params: dict) -> dict:
+        """Запрос к API с выдержкой между вызовами и повтором на рейт-лимит."""
+        last = "bad response"
+        for attempt in range(_TIKWM_RETRIES + 1):
+            async with self._gate:
+                pause = self._next_at - time.monotonic()
+                if pause > 0:
+                    await asyncio.sleep(pause)
+                try:
+                    resp = await self._client.get(
+                        f"{self._base}{path}", params=params, timeout=self._timeout
+                    )
+                finally:
+                    self._next_at = time.monotonic() + self._min_interval
+
+            resp.raise_for_status()
+            payload = resp.json()
+            if payload.get("code") == 0 and payload.get("data"):
+                return payload
+
+            last = str(payload.get("msg") or "bad response")
+            if "limit" not in last.lower() or attempt == _TIKWM_RETRIES:
+                break
+            logger.info("tikwm: %s — ждём и пробуем ещё раз", last)
+        raise ProviderError(f"tikwm: {last}")
+
     async def resolve(self, url: str) -> Media:
-        resp = await self._client.get(
-            f"{self._base}/api/",
-            params={"url": url, "hd": 1},
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        if payload.get("code") != 0 or not payload.get("data"):
-            raise ProviderError(f"tikwm: {payload.get('msg', 'bad response')}")
+        payload = await self._api("/api/", {"url": url, "hd": 1})
         d = payload["data"]
 
         images = d.get("images") or None
@@ -189,16 +281,11 @@ class TikwmProvider:
             duration=_as_float(d.get("duration")),
         )
 
-    async def list_user(self, username: str, count: int) -> list[Media]:
-        resp = await self._client.get(
-            f"{self._base}/api/user/posts",
-            params={"unique_id": username, "count": count},
-            timeout=self._timeout,
+    async def list_feed(self, watch: Watch, count: int) -> list[Media]:
+        username = watch.key
+        payload = await self._api(
+            "/api/user/posts", {"unique_id": username, "count": count}
         )
-        resp.raise_for_status()
-        payload = resp.json()
-        if payload.get("code") != 0:
-            raise ProviderError(f"tikwm user/posts: {payload.get('msg', 'bad response')}")
         items = (payload.get("data") or {}).get("videos") or []
         videos: list[Media] = []
         for it in items:
@@ -297,6 +384,8 @@ class YtDlpProvider:
             "noplaylist": True,
             "socket_timeout": self._timeout,
             "ignoreerrors": False,
+            "retries": 3,
+            "fragment_retries": 3,
         }
         if self._proxy:
             opts["proxy"] = self._proxy
@@ -347,21 +436,26 @@ class YtDlpProvider:
         info = await asyncio.to_thread(self._extract, url, False, None, platform)
         return _media_from_ytdlp(info, url, platform)
 
-    async def list_user(self, username: str, count: int) -> list[Media]:
-        url = f"https://www.tiktok.com/@{username}"
-        info = await asyncio.to_thread(self._extract_flat, url, count)
+    async def list_feed(self, watch: Watch, count: int) -> list[Media]:
+        info = await asyncio.to_thread(self._extract_flat, watch.url, count)
+        platform = watch.platform or Platform.TIKTOK
         out: list[Media] = []
-        for e in (info.get("entries") or [])[:count]:
+        for e in _flat_entries(info)[:count]:
             vid = str(e.get("id") or "")
             if not vid:
                 continue
+            page = e.get("url") or e.get("webpage_url")
+            if not page and platform is Platform.TIKTOK:
+                page = page_url_for(watch.key, vid)
+            if not page:
+                continue
             out.append(
                 Media(
-                    platform=Platform.TIKTOK,
+                    platform=platform,
                     video_id=vid,
-                    author=username,
+                    author=e.get("uploader_id") or watch.key,
                     description=e.get("title") or "",
-                    page_url=e.get("url") or page_url_for(username, vid),
+                    page_url=page,
                 )
             )
         return out
@@ -445,22 +539,28 @@ class Downloader:
                 logger.warning("provider %s failed for %s: %s", provider.name, url, exc)
         raise DownloadError(f"all providers failed for {url}: {last}")
 
-    async def list_user(self, username: str, count: int) -> list[Media]:
-        last: Exception | None = None
-        for provider in self._providers_for(Platform.TIKTOK):
-            if not hasattr(provider, "list_user"):
-                continue
-            try:
-                videos = await provider.list_user(username, count)
-                if videos:
-                    return videos
-            except Exception as exc:
-                last = exc
-                logger.warning(
-                    "provider %s list_user failed for %s: %s", provider.name, username, exc
-                )
-        if last:
-            logger.warning("list_user: all providers failed for %s: %s", username, last)
+    async def list_feed(self, watch: Watch, count: int) -> list[Media]:
+        """Ленту платформы отдают через раз, поэтому цепочку прогоняем несколько раз."""
+        failed = False
+        for attempt in range(_FEED_ATTEMPTS):
+            for provider in self._providers_for(watch.platform):
+                if not hasattr(provider, "list_feed"):
+                    continue
+                try:
+                    videos = await provider.list_feed(watch, count)
+                    if videos:
+                        return videos
+                except Exception as exc:
+                    failed = True
+                    logger.debug(
+                        "provider %s list_feed failed for %s: %s",
+                        provider.name, watch.key, _short(exc),
+                    )
+            if attempt + 1 < _FEED_ATTEMPTS:
+                await asyncio.sleep(_FEED_RETRY_PAUSE)
+
+        if failed:
+            logger.warning("лента %s сейчас недоступна — повторим позже", watch.key)
         return []
 
 
@@ -483,7 +583,12 @@ def build_downloader(settings, client: httpx.AsyncClient) -> Downloader:
     for name in settings.providers:
         if name == "tikwm":
             providers.append(
-                TikwmProvider(settings.tikwm_api_base, client, settings.request_timeout)
+                TikwmProvider(
+                    settings.tikwm_api_base,
+                    client,
+                    settings.request_timeout,
+                    getattr(settings, "tikwm_min_interval", 1.1),
+                )
             )
         elif name == "ytdlp":
             providers.append(make_ytdlp())
