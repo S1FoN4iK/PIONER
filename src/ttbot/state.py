@@ -38,6 +38,12 @@ class State:
                     seen_at   INTEGER NOT NULL,
                     PRIMARY KEY (username, video_id)
                 );
+                CREATE TABLE IF NOT EXISTS prefs (
+                    chat_id  INTEGER NOT NULL,
+                    key      TEXT NOT NULL,
+                    value    TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, key)
+                );
                 """
             )
 
@@ -117,6 +123,45 @@ class State:
 
         async with self._lock:
             return await asyncio.to_thread(_q)
+
+    async def prefs(self, chat_id: int) -> dict[str, str]:
+        def _q() -> dict[str, str]:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    "SELECT key, value FROM prefs WHERE chat_id = ?", (chat_id,)
+                ).fetchall()
+                return {key: value for key, value in rows}
+
+        async with self._lock:
+            return await asyncio.to_thread(_q)
+
+    async def set_pref(self, chat_id: int, key: str, value: str) -> None:
+        """Пустое значение стирает переопределение — вернётся глобальное из .env."""
+
+        def _w() -> None:
+            with closing(self._connect()) as conn, conn:
+                if value:
+                    conn.execute(
+                        "INSERT INTO prefs(chat_id, key, value) VALUES(?, ?, ?) "
+                        "ON CONFLICT(chat_id, key) DO UPDATE SET value = excluded.value",
+                        (chat_id, key, value),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM prefs WHERE chat_id = ? AND key = ?", (chat_id, key)
+                    )
+
+        async with self._lock:
+            await asyncio.to_thread(_w)
+
+    async def clear_prefs(self, chat_id: int) -> int:
+        def _w() -> int:
+            with closing(self._connect()) as conn, conn:
+                cur = conn.execute("DELETE FROM prefs WHERE chat_id = ?", (chat_id,))
+                return cur.rowcount
+
+        async with self._lock:
+            return await asyncio.to_thread(_w)
 
     async def mark_seen(self, profile: str, video_id: str) -> None:
         now = int(time.time())

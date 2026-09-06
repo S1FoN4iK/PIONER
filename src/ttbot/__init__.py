@@ -1,1 +1,1 @@
-"""Telegram bot for TikTok videos"""
+"""Telegram assistant: media downloader + image generation/editing + chat"""
