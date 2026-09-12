@@ -24,7 +24,7 @@ from aiogram.types import (
     Message,
 )
 
-from .ai import AiClient, AiError, ChatMemory, ChatMode, Image, Overrides
+from .ai import AiClient, AiError, Attachment, ChatMemory, ChatMode, Image, Overrides
 from .config import Settings
 from .media import (
     Downloader,
@@ -42,6 +42,7 @@ _CAPTION_LIMIT = 1024
 _PHOTO_LIMIT_MB = 10 
 _TTS_LIMIT = 4000 
 _AGAIN = "again"  
+_FILE_PROMPT = "Посмотри это вложение и расскажи, что в нём."
 
 _PREF_KEYS = {
     "chat_model": "модель для текста",
@@ -287,6 +288,10 @@ class AiResponder:
         return self._ai.can_see
 
     @property
+    def can_watch(self) -> bool:
+        return self._ai.can_watch
+
+    @property
     def can_hear(self) -> bool:
         return self._ai.can_hear
 
@@ -301,6 +306,10 @@ class AiResponder:
     @property
     def can_tune(self) -> bool:
         return self._settings.ai_chat_settings and self._state is not None
+
+    @property
+    def can_attach(self) -> bool:
+        return (self.can_see or self.can_watch) and self._settings.ai_attachments
 
     @staticmethod
     def _key(message: Message) -> tuple[int, int]:
@@ -322,15 +331,24 @@ class AiResponder:
         )
 
     async def ask(self, message: Message, prompt: str) -> None:
-        """Вопрос к модели: с картинкой, если она рядом, иначе обычный текст."""
-        images = await self.images_of(message) if self.can_see else []
-        await self.answer(message, prompt, images or None)
-
-    async def answer(
-        self, message: Message, prompt: str, images: list[Image] | None = None
-    ) -> None:
-        status = await message.reply("👀 Смотрю…" if images else "💭 Думаю…")
-        await self._answer_into(message, status, prompt, images, voice=False)
+        wants_photo = self.can_see and (
+            _has_image(message) or _has_image(message.reply_to_message)
+        )
+        wants_file = self.can_attach and (
+            _has_attachment(message) or _has_attachment(message.reply_to_message)
+        )
+        status = await message.reply(
+            "👀 Смотрю…" if (wants_photo or wants_file) else "💭 Думаю…"
+        )
+        try:
+            images = await self.images_of(message) if wants_photo else []
+            files = await self.files_of(message) if wants_file else []
+        except Exception as exc:
+            await _edit(status, _fail_text(exc))
+            return
+        await self._answer_into(
+            message, status, prompt, images or None, voice=False, files=files or None
+        )
 
     async def _answer_into(
         self,
@@ -339,18 +357,21 @@ class AiResponder:
         prompt: str,
         images: list[Image] | None,
         voice: bool,
-    ) -> None:
+        files: list[Attachment] | None = None,
+    ) -> bool:
         key = self._key(message)
+        has_media = bool(images or files)
         try:
             over = await self._over(message.chat.id)
-            history = None if images else self._memory.history(key)
-            text = await self._ai.chat(prompt, history, over, images)
+            history = None if has_media else self._memory.history(key)
+            text = await self._ai.chat(prompt, history, over, images, files)
         except Exception as exc:
             await _edit(status, _fail_text(exc))
-            return
-        if not images:
+            return False
+        if not has_media:
             self._memory.remember(key, prompt, text)
         await self._deliver(message, status, text, voice)
+        return True
 
     async def _deliver(
         self, message: Message, status: Message, text: str, voice: bool
@@ -441,9 +462,60 @@ class AiResponder:
         data = buf.getvalue()
         return Image.of(data) if data else None
 
+    async def files_of(self, message: Message) -> list[Attachment]:
+        """Видео, аудио, голосовые, кружки, GIF и документы — из ответа и из сообщения."""
+        files: list[Attachment] = []
+        for source in (message.reply_to_message, message):
+            item = await self._download_attachment(source)
+            if item is not None:
+                files.append(item)
+        return files
+
+    async def _download_attachment(self, message: Message | None) -> Attachment | None:
+        target = _attachment_of(message)
+        if target is None:
+            return None
+        limit = self._settings.ai_attachment_max_mb
+        size_mb = (target.file_size or 0) / (1024 * 1024)
+        if size_mb > limit:
+            raise AiError(
+                f"вложение весит {size_mb:.0f} МБ — больше лимита {limit} МБ "
+                "(AI_ATTACHMENT_MAX_MB)"
+            )
+        buf = io.BytesIO()
+        await self._bot.download(target, destination=buf)
+        data = buf.getvalue()
+        if not data:
+            return None
+        mime, name = _describe_attachment(message, target)
+        return Attachment(data, mime, name)
+
     async def listen(self, message: Message) -> None:
-        """Голосовое: расшифровываем, отвечаем — текстом или голосом."""
-        status = await message.reply("🎤 Слушаю…")
+        voice = self._settings.ai_voice_reply
+        if not self.can_attach:
+            await self._retell(message, await message.reply("🎤 Слушаю…"), voice)
+            return
+
+        status = await message.reply("🎧 Слушаю…")
+        try:
+            files = await self.files_of(message)
+        except Exception as exc:
+            if not self.can_hear:
+                await _edit(status, _fail_text(exc))
+                return
+            files = []
+        if files:
+            prompt = (message.caption or "").strip() or "Ответь на это сообщение."
+            done = await self._answer_into(
+                message, status, prompt, None, voice=voice, files=files
+            )
+            if done or not self.can_hear:
+                return
+        await self._retell(message, status, voice)
+
+    async def _retell(self, message: Message, status: Message, voice: bool) -> None:
+        """Старый путь: сначала в текст через AI_TRANSCRIBE_MODEL, потом вопрос."""
+        await _edit(status, "🎤 Расшифровываю…")
         try:
             audio, filename = await self._download_audio(message)
             heard = await self._ai.transcribe(audio, filename)
@@ -451,9 +523,7 @@ class AiResponder:
             await _edit(status, _fail_text(exc))
             return
         await _edit(status, f"🎤 «{heard}»\n💭 Думаю…")
-        await self._answer_into(
-            message, status, heard, None, voice=self._settings.ai_voice_reply
-        )
+        await self._answer_into(message, status, heard, None, voice=voice)
 
     async def say(self, message: Message, text: str) -> None:
         status = await message.reply("🔊 Озвучиваю…")
@@ -606,6 +676,41 @@ def _has_image(message: Message | None) -> bool:
     )
 
 
+def _attachment_of(message: Message | None):
+    """Не-фото вложение сообщения: видео, кружок, аудио, голосовое, GIF, документ."""
+    if message is None or _has_image(message):
+        return None
+    return (
+        message.video
+        or message.video_note
+        or message.audio
+        or message.voice
+        or message.animation
+        or message.document
+    )
+
+
+def _has_attachment(message: Message | None) -> bool:
+    return _attachment_of(message) is not None
+
+
+def _describe_attachment(message: Message, target) -> tuple[str, str]:
+    """MIME и имя файла для вложения — Telegram отдаёт их не для всех типов."""
+    mime = getattr(target, "mime_type", None) or ""
+    name = getattr(target, "file_name", None) or ""
+    if message.voice:
+        mime, name = mime or "audio/ogg", name or "voice.ogg"
+    elif message.video_note:
+        mime, name = mime or "video/mp4", name or "video_note.mp4"
+    elif message.video:
+        mime, name = mime or "video/mp4", name or "video.mp4"
+    elif message.audio:
+        mime, name = mime or "audio/mpeg", name or "audio.mp3"
+    elif message.animation:
+        mime, name = mime or "video/mp4", name or "animation.mp4"
+    return mime or "application/octet-stream", name or "file.bin"
+
+
 def _replied_text(message: Message) -> str:
     reply = message.reply_to_message
     if reply is None:
@@ -706,6 +811,8 @@ def _greeting(ai: AiResponder, settings: Settings) -> str:
         lines.append("👀 фото с вопросом в подписи — расскажу, что на нём")
     if ai.can_hear:
         lines.append("🎤 голосовое — расшифрую и отвечу")
+    if ai.can_attach:
+        lines.append("📎 видео, аудио, документ (PDF, txt…) с вопросом — посмотрю и отвечу")
     if ai.can_sum:
         lines.append("📝 /sum <ссылка> — перескажу содержание ролика")
     if ai.can_speak:
@@ -907,9 +1014,15 @@ def build_router(
 
     @router.message(F.voice | F.video_note | F.audio)
     async def on_voice(message: Message) -> None:
-        if not ai.can_hear or not _wanted(message):
+        if not (ai.can_hear or ai.can_attach) or not _wanted(message):
             return
         await ai.listen(message)
+
+    @router.message((F.video | F.animation | F.document) & ~F.caption)
+    async def on_file(message: Message) -> None:
+        if not ai.can_attach or _has_image(message) or not _wanted(message):
+            return
+        await ai.ask(message, _FILE_PROMPT)
 
     @router.message(F.text | F.caption)
     async def on_message(message: Message) -> None:
@@ -931,9 +1044,12 @@ def build_router(
             return
 
         has_photo = _has_image(message) or _has_image(message.reply_to_message)
+        has_file = ai.can_attach and (
+            _has_attachment(message) or _has_attachment(message.reply_to_message)
+        )
         if has_photo and ai.can_edit and not ai.can_see:
             await ai.redraw(message, text)
-        elif ai.can_chat or (has_photo and ai.can_see):
+        elif ai.can_chat or (has_photo and ai.can_see) or has_file:
             await ai.ask(message, text)
 
     @router.callback_query(F.data.startswith(f"{_AGAIN}:"))

@@ -5,13 +5,29 @@ from __future__ import annotations
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.types import Update
-from conftest import PNG, ai_settings, dummy_client, message, photo, run, voice
+from conftest import (
+    PNG,
+    ai_settings,
+    document,
+    dummy_client,
+    message,
+    photo,
+    run,
+    video,
+    voice,
+)
 import conftest
 
 import httpx
 
-from ttbot.ai import Image, build_ai
-from ttbot.bot import AiResponder, VideoSender, _has_image, build_router
+from ttbot.ai import Attachment, Image, build_ai
+from ttbot.bot import (
+    AiResponder,
+    VideoSender,
+    _has_attachment,
+    _has_image,
+    build_router,
+)
 from ttbot.media import build_downloader
 
 CALLS: list[tuple[str, str]] = []
@@ -20,12 +36,13 @@ CALLS: list[tuple[str, str]] = []
 class SpyAi(AiResponder):
     """Считаем, какое действие выбрал роутер, до похода в сеть."""
 
-    async def answer(self, message, prompt, images=None):
-        CALLS.append(("vision" if images else "chat", prompt))
+    async def answer(self, message, prompt, images=None, files=None):
+        CALLS.append(("vision" if (images or files) else "chat", prompt))
 
     async def ask(self, message, prompt):
         images = await self.images_of(message) if self.can_see else []
-        await self.answer(message, prompt, images or None)
+        files = await self.files_of(message) if self.can_attach else []
+        await self.answer(message, prompt, images or None, files or None)
 
     async def draw(self, message, prompt):
         CALLS.append(("draw", prompt))
@@ -51,6 +68,14 @@ class SpyAi(AiResponder):
     async def images_of(self, message):
         sources = (message, message.reply_to_message)
         return [Image.of(PNG) for m in sources if _has_image(m)]
+
+    async def files_of(self, message):
+        sources = (message, message.reply_to_message)
+        return [
+            Attachment(b"data", "video/mp4", "v.mp4")
+            for m in sources
+            if _has_attachment(m)
+        ]
 
 
 class SpySender(VideoSender):
@@ -271,8 +296,13 @@ def test_voice_in_group_is_ignored(bot):
     assert route(dp, bot, msg) == []
 
 
-def test_voice_ignored_without_transcribe_model(bot):
+def test_voice_goes_to_multimodal_model_without_transcriber(bot):
     dp = dispatcher(bot, ai_transcribe_model="")
+    assert route(dp, bot, message(bot, voice_note=voice())) == [("listen", "")]
+
+
+def test_voice_ignored_without_transcriber_and_attachments(bot):
+    dp = dispatcher(bot, ai_transcribe_model="", ai_attachments=False)
     assert route(dp, bot, message(bot, voice_note=voice())) == []
 
 
@@ -366,3 +396,56 @@ def test_allowlist_blocks_foreign_chats(bot):
 def test_allowlist_lets_its_own_chat_through(bot):
     dp = dispatcher(bot, allowed_chat_ids=str(conftest.CHAT_ID))
     assert route(dp, bot, message(bot, "/img кот")) == [("draw", "кот")]
+
+
+# --- видео и документы как вложения --------------------------------------
+
+
+def test_video_without_caption_is_described(bot):
+    from ttbot.bot import _FILE_PROMPT
+
+    dp = dispatcher(bot)
+    assert route(dp, bot, message(bot, video_file=video())) == [("vision", _FILE_PROMPT)]
+
+
+def test_video_with_caption_asks_the_caption(bot):
+    dp = dispatcher(bot)
+    msg = message(bot, caption="что на видео?", video_file=video())
+    assert route(dp, bot, msg) == [("vision", "что на видео?")]
+
+
+def test_reply_to_a_video_is_a_question_about_it(bot):
+    dp = dispatcher(bot)
+    src = message(bot, video_file=video())
+    msg = message(bot, "а что там в конце?", reply=src)
+    assert route(dp, bot, msg) == [("vision", "а что там в конце?")]
+
+
+def test_document_without_caption_is_described(bot):
+    from ttbot.bot import _FILE_PROMPT
+
+    dp = dispatcher(bot)
+    assert route(dp, bot, message(bot, doc=document())) == [("vision", _FILE_PROMPT)]
+
+
+def test_video_in_group_needs_a_mention(bot):
+    dp = dispatcher(bot)
+    msg = message(bot, caption="что тут?", video_file=video(), chat_type="supergroup")
+    assert route(dp, bot, msg) == []
+
+
+def test_video_in_group_with_a_mention_works(bot):
+    dp = dispatcher(bot)
+    msg = message(bot, caption="@MyBot что тут?", video_file=video(), chat_type="supergroup")
+    assert route(dp, bot, msg) == [("vision", "что тут?")]
+
+
+def test_video_ignored_when_attachments_are_off(bot):
+    dp = dispatcher(bot, ai_attachments=False)
+    assert route(dp, bot, message(bot, video_file=video())) == []
+
+
+def test_link_in_a_video_caption_still_downloads(bot):
+    dp = dispatcher(bot)
+    msg = message(bot, caption="https://vt.tiktok.com/ZS123/", video_file=video())
+    assert route(dp, bot, msg) == [("download", "https://vt.tiktok.com/ZS123/")]

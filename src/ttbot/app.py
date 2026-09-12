@@ -73,35 +73,49 @@ async def run() -> None:
     )
     settings = Settings()
 
-    proxy = settings.proxy_url or None
-    if proxy:
-        logger.info("routing Telegram + downloads through proxy (AI stays direct)")
+    tg_proxy = settings.telegram_proxy
+    dl_proxy = settings.download_proxy
+    ai_proxy = settings.ai_proxy
+    logger.info(
+        "proxy: telegram=%s downloads=%s ai=%s",
+        "on" if tg_proxy else "direct",
+        "on" if dl_proxy else "direct",
+        "on" if ai_proxy else "direct",
+    )
     client = httpx.AsyncClient(
         follow_redirects=True,
         headers={"User-Agent": "media-tg-bot"},
-        proxy=proxy,
+        proxy=dl_proxy,
     )
-    ai_client = httpx.AsyncClient(follow_redirects=True)
+    ai_client = httpx.AsyncClient(follow_redirects=True, proxy=ai_proxy)
     downloader = build_downloader(settings, client)
     state = State(settings.state_file)
 
-    session = AiohttpSession(proxy=proxy) if proxy else None
+    session = AiohttpSession(proxy=tg_proxy) if tg_proxy else None
     bot = Bot(token=settings.bot_token, session=session)
     dp = Dispatcher()
     sender = VideoSender(bot, settings, downloader)
     ai = AiResponder(bot, settings, build_ai(settings, ai_client), state, downloader)
     if ai.enabled:
         logger.info(
-            "ai enabled: chat=%s draw=%s edit=%s see=%s hear=%s speak=%s sum=%s (mode=%s)",
+            "ai enabled: chat=%s draw=%s edit=%s see=%s watch=%s hear=%s speak=%s sum=%s (mode=%s)",
             ai.can_chat,
             ai.can_draw,
             ai.can_edit,
             ai.can_see,
+            ai.can_watch,
             ai.can_hear,
             ai.can_speak,
             ai.can_sum,
             settings.ai_chat_mode,
         )
+        if ai.can_attach and not settings.ai_media_model.strip():
+            logger.warning(
+                "AI_MEDIA_MODEL пуст — видео и аудио уйдут в %s. Текстовая модель их "
+                "молча проигнорирует и ответит, что вложения не видит; для медиа "
+                "укажите мультимодальную модель, например google/gemini-2.5-flash",
+                settings.ai_vision_model.strip() or settings.ai_chat_model,
+            )
     else:
         logger.info("ai disabled (need both AI_API_BASE and AI_API_KEY)")
 

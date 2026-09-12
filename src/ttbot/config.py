@@ -6,6 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _CHAT_MODES = ("off", "mention", "always")
 _IMAGE_APIS = ("images", "chat")
 _REPORT_MODES = ("off", "fail", "always")
+_DOC_PARTS = ("file", "inline")
+_PROXY_ON = ("on", "true", "yes", "1")
+_PROXY_OFF = ("off", "false", "no", "0", "")
 
 
 def _one_of(value: object, allowed: tuple[str, ...], field: str, blank_ok: bool = False) -> object:
@@ -59,6 +62,41 @@ class Settings(BaseSettings):
 
     # --- Network ---
     proxy_url: str = ""
+    proxy_telegram: str = "on"
+    proxy_downloads: str = "on"
+    proxy_ai: str = "off"
+
+    @field_validator("proxy_telegram", "proxy_downloads", "proxy_ai", mode="before")
+    @classmethod
+    def _check_proxy(cls, v: object) -> object:
+        if not isinstance(v, str):
+            return v
+        raw = v.strip()
+        if raw.lower() in _PROXY_ON or raw.lower() in _PROXY_OFF or "://" in raw:
+            return raw
+        raise ValueError(
+            f"прокси: ожидается on, off или URL вида scheme://host:port, получено {v!r}"
+        )
+
+    def _resolve_proxy(self, raw: str) -> str | None:
+        v = raw.strip()
+        if v.lower() in _PROXY_ON:
+            return self.proxy_url.strip() or None
+        if v.lower() in _PROXY_OFF:
+            return None
+        return v
+
+    @property
+    def telegram_proxy(self) -> str | None:
+        return self._resolve_proxy(self.proxy_telegram)
+
+    @property
+    def download_proxy(self) -> str | None:
+        return self._resolve_proxy(self.proxy_downloads)
+
+    @property
+    def ai_proxy(self) -> str | None:
+        return self._resolve_proxy(self.proxy_ai)
 
     # --- Auth (optional, mostly for Instagram / age-gated YouTube) ---
     cookies_file: str = ""
@@ -77,7 +115,7 @@ class Settings(BaseSettings):
     ai_chat_triggers: str = "Ответь,Объясни,Расскажи"
     ai_image_triggers: str = "Сгенерируй,Нарисуй"
     ai_edit_triggers: str = "Отредактируй,Измени,Переделай"
-    ai_history_turns: int = 8
+    ai_history_turns: int = 64
     ai_history_ttl_minutes: int = 60
     ai_max_tokens: int = 0
     ai_temperature: float | None = None
@@ -88,6 +126,10 @@ class Settings(BaseSettings):
 
     # --- AI: vision, voice, retelling ---
     ai_vision_model: str = ""
+    ai_media_model: str = ""
+    ai_attachments: bool = True
+    ai_doc_part: str = "file"
+    ai_attachment_max_mb: int = 20
     ai_transcribe_model: str = ""
     ai_tts_model: str = ""
     ai_tts_voice: str = "alloy"
@@ -110,6 +152,11 @@ class Settings(BaseSettings):
     @classmethod
     def _check_image_api(cls, v: object) -> object:
         return _one_of(v, _IMAGE_APIS, "AI_IMAGE_API")
+
+    @field_validator("ai_doc_part", mode="before")
+    @classmethod
+    def _check_doc_part(cls, v: object) -> object:
+        return _one_of(v, _DOC_PARTS, "AI_DOC_PART")
 
     @field_validator("ai_image_edit_api", mode="before")
     @classmethod

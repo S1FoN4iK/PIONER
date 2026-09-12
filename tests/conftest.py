@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 from aiogram import Bot
-from aiogram.types import Chat, Message, PhotoSize, User, Voice
+from aiogram.types import Chat, Document, Message, PhotoSize, User, Video, Voice
 
 from ttbot.config import Settings
 
@@ -86,6 +86,24 @@ def voice() -> Voice:
     return Voice(file_id="v", file_unique_id="vu", duration=3)
 
 
+def video(size: int = 1024, mime: str | None = "video/mp4") -> Video:
+    return Video(
+        file_id="vid",
+        file_unique_id="vidu",
+        width=320,
+        height=240,
+        duration=5,
+        mime_type=mime,
+        file_size=size,
+    )
+
+
+def document(name: str = "note.txt", mime: str = "text/plain", size: int = 512) -> Document:
+    return Document(
+        file_id="doc", file_unique_id="docu", file_name=name, mime_type=mime, file_size=size
+    )
+
+
 def message(
     bot: Bot,
     text: str | None = None,
@@ -93,6 +111,8 @@ def message(
     caption: str | None = None,
     photo_sizes: list[PhotoSize] | None = None,
     voice_note: Voice | None = None,
+    video_file: Video | None = None,
+    doc: Document | None = None,
     chat_type: str = "private",
     reply: Message | None = None,
     from_bot: bool = False,
@@ -106,6 +126,8 @@ def message(
         caption=caption,
         photo=photo_sizes,
         voice=voice_note,
+        video=video_file,
+        document=doc,
         reply_to_message=reply,
     ).as_(bot)
 

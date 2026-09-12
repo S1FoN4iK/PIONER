@@ -74,6 +74,10 @@ class Image:
         return f"image{_MIME_EXT.get(self.mime, '.png')}"
 
     @property
+    def kind(self) -> str:
+        return "image"
+
+    @property
     def size_mb(self) -> float:
         return len(self.data) / (1024 * 1024)
 
@@ -199,12 +203,115 @@ def _backoff(attempt: int, retry_after: str | None) -> float:
     return min(2.0**attempt + random.uniform(0, 0.5), _RETRY_CAP_SECONDS)
 
 
-def _image_part(image: Image) -> dict:
-    encoded = base64.b64encode(image.data).decode("ascii")
-    return {
-        "type": "image_url",
-        "image_url": {"url": f"data:{image.mime};base64,{encoded}"},
+_AUDIO_FORMATS = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/flac": "flac",
+    "audio/webm": "webm",
+    "audio/ogg": "ogg",
+    "audio/opus": "ogg",
+}
+
+_VIDEO_FORMATS = {
+    "video/mp4": "mp4",
+    "video/quicktime": "mov",
+    "video/webm": "webm",
+    "video/x-matroska": "mkv",
+    "video/mpeg": "mpeg",
+    "video/3gpp": "3gp",
+    "video/x-msvideo": "avi",
+}
+
+_TEXT_MIMES = frozenset(
+    {
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/x-yaml",
+        "application/yaml",
+        "application/x-sh",
+        "application/sql",
+        "application/csv",
     }
+)
+_TEXT_CHARS = 60_000
+
+IMAGE, AUDIO, VIDEO, TEXT, FILE = "image", "audio", "video", "text", "file"
+_RICH = frozenset({IMAGE, AUDIO, VIDEO, FILE})
+_HEAVY = frozenset({AUDIO, VIDEO})
+
+
+def _kind_of(mime: str) -> str:
+    mime = (mime or "").split(";", 1)[0].strip().lower()
+    for family in (IMAGE, AUDIO, VIDEO):
+        if mime.startswith(f"{family}/"):
+            return family
+    if mime.startswith("text/") or mime in _TEXT_MIMES:
+        return TEXT
+    return FILE
+
+
+@dataclass
+class Attachment:
+
+    data: bytes
+    mime: str
+    filename: str
+
+    @property
+    def kind(self) -> str:
+        return _kind_of(self.mime)
+
+    @property
+    def size_mb(self) -> float:
+        return len(self.data) / (1024 * 1024)
+
+
+def _media_format(mime: str, table: dict[str, str]) -> str:
+    mime = (mime or "").split(";", 1)[0].strip().lower()
+    known = table.get(mime)
+    if known:
+        return known
+    tail = mime.split("/", 1)[-1] if "/" in mime else mime
+    return tail.removeprefix("x-") or "bin"
+
+
+def _as_text(item: Attachment) -> str:
+    body = item.data.decode("utf-8", "replace")[:_TEXT_CHARS].strip()
+    return f"Содержимое файла «{item.filename}»:\n\n{body}"
+
+
+def _content_part(item: Image | Attachment, doc_inline: bool = False) -> dict:
+    """Часть user-сообщения в формате OpenAI-совместимого chat/completions."""
+    mime = item.mime or "application/octet-stream"
+    kind = item.kind
+    if kind == TEXT:
+        return {"type": "text", "text": _as_text(item)}
+    encoded = base64.b64encode(item.data).decode("ascii")
+    if kind == IMAGE or (kind == FILE and doc_inline):
+        return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
+    if kind in _HEAVY:
+        table = _AUDIO_FORMATS if kind == AUDIO else _VIDEO_FORMATS
+        return {
+            "type": "input_audio",
+            "input_audio": {"data": encoded, "format": _media_format(mime, table)},
+        }
+    return {
+        "type": "file",
+        "file": {
+            "filename": item.filename,
+            "file_data": f"data:{mime};base64,{encoded}",
+        },
+    }
+
+
+def _image_part(image: Image) -> dict:
+    return _content_part(image)
 
 
 def _ref_from_url(value: str) -> _ImageRef | None:
@@ -248,9 +355,11 @@ class AiClient:
         image_model: str = "",
         image_edit_model: str = "",
         vision_model: str = "",
+        media_model: str = "",
         transcribe_model: str = "",
         tts_model: str = "",
         tts_voice: str = "alloy",
+        doc_inline: bool = False,
         image_api: ImageApi = ImageApi.IMAGES,
         image_edit_api: ImageApi = ImageApi.IMAGES,
         system_prompt: str = "",
@@ -269,9 +378,12 @@ class AiClient:
         self._edit_model = image_edit_model.strip() or self._image_model
         vision = vision_model.strip()
         self._vision_model = "" if vision.lower() in _OFF else (vision or self._chat_model)
+        media = media_model.strip()
+        self._media_model = "" if media.lower() in _OFF else (media or self._vision_model)
         self._transcribe_model = transcribe_model.strip()
         self._tts_model = tts_model.strip()
         self._tts_voice = tts_voice.strip() or "alloy"
+        self._doc_inline = doc_inline
         self._image_api = image_api
         self._edit_api = image_edit_api
         self._system_prompt = system_prompt.strip()
@@ -303,6 +415,11 @@ class AiClient:
         return self.enabled and bool(self._vision_model)
 
     @property
+    def can_watch(self) -> bool:
+        """Есть кому отдать видео и аудио файлом, без расшифровки."""
+        return self.enabled and bool(self._media_model)
+
+    @property
     def can_hear(self) -> bool:
         return self.enabled and bool(self._transcribe_model)
 
@@ -316,16 +433,18 @@ class AiClient:
         history: list[dict] | None = None,
         over: Overrides = _NO_OVERRIDES,
         images: list[Image] | None = None,
+        files: list[Attachment] | None = None,
     ) -> str:
-        """Обычный вопрос; с images — вопрос про картинку (vision)."""
-        model = (
-            (over.chat_model or self._vision_model)
-            if images
-            else (over.chat_model or self._chat_model)
-        )
+        media: list[Image | Attachment] = [*(images or []), *(files or [])]
+        kinds = {m.kind for m in media}
+        model = over.chat_model or self._model_for(kinds)
+
         content: object = prompt
-        if images:
-            content = [{"type": "text", "text": prompt}, *(_image_part(i) for i in images)]
+        if media:
+            content = [
+                {"type": "text", "text": prompt},
+                *(_content_part(m, self._doc_inline) for m in media),
+            ]
 
         messages: list[dict] = []
         system = over.system_prompt or self._system_prompt
@@ -334,13 +453,36 @@ class AiClient:
         messages.extend(history or [])
         messages.append({"role": "user", "content": content})
 
-        payload = await self._post(
-            "/chat/completions", json=self._chat_body(model, messages)
-        )
+        try:
+            payload = await self._post(
+                "/chat/completions", json=self._chat_body(model, messages)
+            )
+        except AiError as exc:
+            raise self._media_hint(exc, model, kinds) from exc
         text = _text_from_choices(payload)
         if not text:
             raise AiError("модель вернула пустой ответ")
         return text
+
+    def _model_for(self, kinds: set[str]) -> str:
+        heavy = _HEAVY | {FILE} if self._doc_inline else _HEAVY
+        if kinds & heavy:
+            return self._media_model or self._vision_model or self._chat_model
+        if kinds & _RICH:
+            return self._vision_model or self._chat_model
+        return self._chat_model
+
+    @staticmethod
+    def _media_hint(exc: AiError, model: str, kinds: set[str]) -> AiError:
+        heavy = sorted(kinds & _HEAVY)
+        if not heavy:
+            return exc
+        what = " и ".join("видео" if k == VIDEO else "аудио" for k in heavy)
+        return AiError(
+            f"{exc}\n\nПохоже, модель {model} не принимает {what}. "
+            "Укажите в AI_MEDIA_MODEL мультимодальную модель "
+            "(например, google/gemini-2.5-flash)."
+        )
 
     async def draw(self, prompt: str, over: Overrides = _NO_OVERRIDES) -> list[Image]:
         model = over.image_model or self._image_model
@@ -537,9 +679,11 @@ def build_ai(settings, client: httpx.AsyncClient) -> AiClient:
         image_model=settings.ai_image_model,
         image_edit_model=settings.ai_image_edit_model,
         vision_model=settings.ai_vision_model,
+        media_model=settings.ai_media_model,
         transcribe_model=settings.ai_transcribe_model,
         tts_model=settings.ai_tts_model,
         tts_voice=settings.ai_tts_voice,
+        doc_inline=settings.ai_doc_part == "inline",
         image_api=ImageApi(settings.ai_image_api),
         image_edit_api=ImageApi(settings.ai_edit_api),
         system_prompt=settings.ai_system_prompt,

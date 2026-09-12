@@ -565,7 +565,7 @@ class Downloader:
 
 
 def build_downloader(settings, client: httpx.AsyncClient) -> Downloader:
-    proxy = getattr(settings, "proxy_url", "") or None
+    proxy = getattr(settings, "download_proxy", None) or None
     cookies_file = getattr(settings, "cookies_file", "") or None
     cookies_browser = getattr(settings, "cookies_from_browser", "") or None
     yt_height = getattr(settings, "youtube_max_height", 720)
